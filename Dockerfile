@@ -1,19 +1,17 @@
 FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
 
-# Use a venv for cleanliness
-ENV VIRTUAL_ENV=/opt/venv
-RUN python -m venv $VIRTUAL_ENV
-ENV PATH="$VIRTUAL_ENV/bin:$PATH"
-
-# Install Python deps
+# Dossier de travail
 WORKDIR /app
-COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Copy app
+# Dépendances Python
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+# Code
 COPY app.py /app/app.py
 
-# Render sets the PORT env var; our app will use it
+# Port exposé (Render fournit $PORT, lu par app.py)
 EXPOSE 8000
 
 CMD ["python", "app.py"]
