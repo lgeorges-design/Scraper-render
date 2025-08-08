@@ -29,8 +29,7 @@ class JobItem(BaseModel):
     date_candidature: str = ""
     date_reponse: str = ""
     delai_reponse: str = ""
-    commentaires: str = ""  # j'y mets le lien de l'offre pour l’instant
-
+    commentaires: str = ""  # pour l’instant on y met le lien
 
 # =========
 # Helpers
@@ -52,19 +51,15 @@ def set_if(obj: JobItem, name: str, value: str | None):
     if value and isinstance(value, str):
         setattr(obj, name, normalize(value))
 
-
 # =========================
-# Generic static/dynamic fetch
+# Fallbacks: static/dynamic
 # =========================
 @retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(3))
 def fetch_static(url: str) -> list[JobItem]:
-    """Requests + BS4 for simple/static pages (fallback)."""
     resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     jobs: list[JobItem] = []
-
-    # Sélecteurs génériques (peuvent matcher sur certains sites)
     for card in soup.select("[data-job-card], .job-card, article"):
         title_el = card.select_one("[data-testid='job-title'], .title, h2, a")
         company_el = card.select_one(".company, .employer, [data-testid='company-name']")
@@ -73,25 +68,18 @@ def fetch_static(url: str) -> list[JobItem]:
         entreprise = normalize(company_el.get_text()) if company_el else ""
         localisation = normalize(loc_el.get_text()) if loc_el else ""
         if poste:
-            item = JobItem(source=url, poste=poste, entreprise=entreprise, localisation=localisation)
-            jobs.append(item)
-
+            jobs.append(JobItem(source=url, poste=poste, entreprise=entreprise, localisation=localisation))
     return jobs
 
-
 def fetch_dynamic(url: str) -> list[JobItem]:
-    """Playwright pour pages dynamiques (fallback générique)."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         ctx = browser.new_context(user_agent="Mozilla/5.0")
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
-
-        # scroll pour lazy-load
         for _ in range(8):
             page.mouse.wheel(0, 1400)
             page.wait_for_timeout(400)
-
         jobs: list[JobItem] = []
         cards = page.query_selector_all("[data-job-card], .job-card, article")
         for c in cards:
@@ -99,22 +87,26 @@ def fetch_dynamic(url: str) -> list[JobItem]:
             poste = normalize(title.inner_text() if title else (c.inner_text().splitlines()[0] if c.inner_text() else ""))
             if poste:
                 jobs.append(JobItem(source=url, poste=poste))
-
         browser.close()
     return jobs
-
 
 # =========================
 # Adapter: HelloWork (listing)
 # =========================
 def fetch_hellowork(url: str) -> list[JobItem]:
+    from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = browser.new_context(user_agent="Mozilla/5.0")
+        ctx = browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"),
+            locale="fr-FR"
+        )
         page = ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.goto(url, wait_until="networkidle", timeout=90000)
 
-        # Cookies (essaye divers libellés)
+        # Consent cookies (essaye plusieurs libellés)
         for txt in ["Tout accepter", "Accepter", "J’accepte", "J'accepte", "OK"]:
             try:
                 page.get_by_role("button", name=txt, exact=False).click(timeout=2000)
@@ -123,56 +115,82 @@ def fetch_hellowork(url: str) -> list[JobItem]:
                 pass
 
         # Lazy load
-        for _ in range(10):
-            page.mouse.wheel(0, 1500)
-            page.wait_for_timeout(350)
+        for _ in range(14):
+            page.mouse.wheel(0, 1600)
+            page.wait_for_timeout(300)
 
         jobs: list[JobItem] = []
 
-        selectors = [
-            "article[data-testid='job-card']",
-            "article[data-qa='job-card']",
-            "article.card-offer, article",
-        ]
-        cards = []
-        for sel in selectors:
-            nodes = page.query_selector_all(sel)
-            if nodes:
-                cards = nodes
-                break
+        # 1) Ratisser large: liens plausibles d'offres
+        offer_links = page.locator("a[href*='/fr-fr/emploi/'], a[href*='/offre/']")
+        count = offer_links.count()
+        if count == 0:
+            offer_links = page.locator("a:has-text('Offre'), a:has-text('Poste')")
+            count = offer_links.count()
 
-        for c in cards:
-            title = (c.query_selector("[data-testid='job-title']") or
-                     c.query_selector("h3, h2, .title, a[title]"))
-            poste = normalize(title.inner_text()) if title else ""
+        for i in range(min(count, 120)):  # limite raisonnable
+            a = offer_links.nth(i)
+            href = a.get_attribute("href") or ""
+            txt = (a.inner_text() or "").strip()
+            if not txt:
+                continue
 
-            company = (c.query_selector("[data-testid='company-name']") or
-                       c.query_selector(".company, .recruiter, [itemprop='hiringOrganization']"))
-            entreprise = normalize(company.inner_text()) if company else ""
-
-            loc = (c.query_selector("[data-testid='location']") or
-                   c.query_selector(".location, [itemprop='addressLocality']"))
-            localisation = normalize(loc.inner_text()) if loc else ""
-
-            link = (c.query_selector("a[href*='/emploi/']") or
-                    c.query_selector("a[href*='offre']") or
-                    c.query_selector("a"))
-            lien = link.get_attribute("href") if link else ""
-            if lien and lien.startswith("/"):
+            # Normaliser l’URL absolue
+            if href.startswith("/"):
                 base = page.url.split("/", 3)
                 if len(base) >= 3:
-                    lien = f"{base[0]}//{base[2]}{lien}"
+                    href = f"{base[0]}//{base[2]}{href}"
 
-            if poste:
-                item = JobItem(source="hellowork", poste=poste)
-                set_if(item, "entreprise", entreprise)
-                set_if(item, "localisation", localisation)
-                item.commentaires = lien or ""
-                jobs.append(item)
+            # Remonter au container (carte probable)
+            container = a.locator("xpath=ancestor::article[1]")
+            if container.count() == 0:
+                container = a.locator("xpath=ancestor::*[self::li or self::div][contains(@class,'card')][1]")
+
+            # Titre
+            title = txt
+            try:
+                t2 = container.locator("[data-testid='job-title'], h2, h3, .title").first
+                if t2.count() > 0:
+                    title = (t2.inner_text() or title).strip()
+            except Exception:
+                pass
+
+            # Entreprise
+            company = ""
+            for sel in ["[data-testid='company-name']", ".company", ".recruiter",
+                        "[itemprop='hiringOrganization']", ".job-company"]:
+                try:
+                    el = container.locator(sel).first
+                    if el.count() > 0:
+                        company = (el.inner_text() or "").strip()
+                        break
+                except Exception:
+                    pass
+
+            # Localisation
+            location = ""
+            for sel in ["[data-testid='location']", ".location", "[itemprop='addressLocality']",
+                        ".job-location"]:
+                try:
+                    el = container.locator(sel).first
+                    if el.count() > 0:
+                        location = (el.inner_text() or "").strip()
+                        break
+                except Exception:
+                    pass
+
+            # Filtrer le bruit évident
+            if len(title) < 4 or "cookie" in title.lower():
+                continue
+
+            item = JobItem(source="hellowork", poste=title)
+            set_if(item, "entreprise", company)
+            set_if(item, "localisation", location)
+            item.commentaires = href
+            jobs.append(item)
 
         browser.close()
         return uniq(jobs)
-
 
 # ==================================
 # Adapter: Jobs That Make Sense (JMS)
@@ -180,10 +198,11 @@ def fetch_hellowork(url: str) -> list[JobItem]:
 def fetch_makesense(url: str) -> list[JobItem]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = browser.new_context(user_agent="Mozilla/5.0")
+        ctx = browser.new_context(user_agent="Mozilla/5.0", locale="fr-FR")
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
+        # Consent
         for txt in ["Tout accepter", "Accepter", "J’accepte", "J'accepte", "OK"]:
             try:
                 page.get_by_role("button", name=txt, exact=False).click(timeout=2000)
@@ -191,6 +210,7 @@ def fetch_makesense(url: str) -> list[JobItem]:
             except Exception:
                 pass
 
+        # Lazy load
         for _ in range(12):
             page.mouse.wheel(0, 1500)
             page.wait_for_timeout(300)
@@ -238,7 +258,6 @@ def fetch_makesense(url: str) -> list[JobItem]:
         browser.close()
         return uniq(jobs)
 
-
 # =========================
 # Adapter selector (router)
 # =========================
@@ -249,7 +268,6 @@ def select_adapter(url: str):
         return fetch_makesense
     dynamic_domains = ["welcometothejungle.com"]
     return fetch_dynamic if any(d in url for d in dynamic_domains) else fetch_static
-
 
 # =========
 # Routes
@@ -283,7 +301,6 @@ def scrape():
         except Exception as e:
             out.append(JobItem(source=u, commentaires=f"ERROR: {type(e).__name__}: {e}").model_dump())
     return jsonify(out)
-
 
 # =========
 # Main
