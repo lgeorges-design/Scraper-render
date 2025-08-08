@@ -1,0 +1,5 @@
+flask
+pydantic>=2.7.0
+beautifulsoup4
+requests
+tenacity
