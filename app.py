@@ -1,311 +1,180 @@
-import os, sys, re
-from datetime import date
-
 from flask import Flask, request, jsonify
-from pydantic import BaseModel, Field
-from bs4 import BeautifulSoup
-import requests
-from tenacity import retry, wait_exponential, stop_after_attempt
 from playwright.sync_api import sync_playwright
+import re
+from datetime import datetime
 
 app = Flask(__name__)
 
-# =========
-# Data model
-# =========
-class JobItem(BaseModel):
-    date: str = Field(default_factory=lambda: date.today().isoformat())
-    source: str = ""
-    entreprise: str = ""
-    localisation: str = ""
-    secteur: str = ""
-    taille_entreprise: str = ""
-    poste: str = ""
-    experience_demandee: str = ""
-    competences: list[str] = []
-    score: int = 0
-    pitch: str = ""
-    statut: str = "À traiter"
-    date_candidature: str = ""
-    date_reponse: str = ""
-    delai_reponse: str = ""
-    commentaires: str = ""  # pour l’instant on y met le lien
-
-# =========
+# =====================
 # Helpers
-# =========
-def normalize(text: str | None) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip())
+# =====================
+class JobItem(dict):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.update({
+            "commentaires": "",
+            "competences": [],
+            "date": datetime.today().strftime("%Y-%m-%d"),
+            "date_candidature": "",
+            "date_reponse": "",
+            "delai_reponse": "",
+            "entreprise": "",
+            "experience_demandee": "",
+            "localisation": "",
+            "pitch": "",
+            "poste": "",
+            "score": 0,
+            "secteur": "",
+            "source": "",
+            "statut": "À traiter",
+            "taille_entreprise": ""
+        })
 
-def uniq(seq: list[JobItem]) -> list[JobItem]:
+def set_if(job, field, value):
+    if value and value.strip():
+        job[field] = value.strip()
+
+def uniq(jobs):
     seen = set()
-    out: list[JobItem] = []
-    for x in seq:
-        key = (x.poste, x.entreprise, x.localisation, x.commentaires)
+    out = []
+    for j in jobs:
+        key = j["commentaires"]
         if key not in seen:
             seen.add(key)
-            out.append(x)
+            out.append(j)
     return out
 
-def set_if(obj: JobItem, name: str, value: str | None):
-    if value and isinstance(value, str):
-        setattr(obj, name, normalize(value))
-
-# =========================
-# Fallbacks: static/dynamic
-# =========================
-@retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(3))
-def fetch_static(url: str) -> list[JobItem]:
-    resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    jobs: list[JobItem] = []
-    for card in soup.select("[data-job-card], .job-card, article"):
-        title_el = card.select_one("[data-testid='job-title'], .title, h2, a")
-        company_el = card.select_one(".company, .employer, [data-testid='company-name']")
-        loc_el = card.select_one(".location, [data-testid='location']")
-        poste = normalize(title_el.get_text()) if title_el else ""
-        entreprise = normalize(company_el.get_text()) if company_el else ""
-        localisation = normalize(loc_el.get_text()) if loc_el else ""
-        if poste:
-            jobs.append(JobItem(source=url, poste=poste, entreprise=entreprise, localisation=localisation))
-    return jobs
-
-def fetch_dynamic(url: str) -> list[JobItem]:
+# =====================
+# Scraper HelloWork
+# =====================
+def fetch_hellowork(url: str) -> list:
+    jobs = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = browser.new_context(user_agent="Mozilla/5.0")
-        page = ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        for _ in range(8):
-            page.mouse.wheel(0, 1400)
-            page.wait_for_timeout(400)
-        jobs: list[JobItem] = []
-        cards = page.query_selector_all("[data-job-card], .job-card, article")
-        for c in cards:
-            title = c.query_selector("[data-testid='job-title'], .title, h2, a")
-            poste = normalize(title.inner_text() if title else (c.inner_text().splitlines()[0] if c.inner_text() else ""))
-            if poste:
-                jobs.append(JobItem(source=url, poste=poste))
-        browser.close()
-    return jobs
-
-# =========================
-# Adapter: HelloWork (listing)
-# =========================
-def fetch_hellowork(url: str) -> list[JobItem]:
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"),
-            locale="fr-FR"
-        )
+        ctx = browser.new_context(locale="fr-FR")
         page = ctx.new_page()
         page.goto(url, wait_until="networkidle", timeout=90000)
 
-        # Consent cookies (essaye plusieurs libellés)
+        # Accepter cookies si bouton présent
         for txt in ["Tout accepter", "Accepter", "J’accepte", "J'accepte", "OK"]:
             try:
                 page.get_by_role("button", name=txt, exact=False).click(timeout=2000)
                 break
-            except Exception:
+            except:
                 pass
 
-        # Lazy load
-        for _ in range(14):
-            page.mouse.wheel(0, 1600)
+        # Scroll pour charger toutes les offres
+        for _ in range(12):
+            page.mouse.wheel(0, 2000)
             page.wait_for_timeout(300)
 
-        jobs: list[JobItem] = []
+        links = page.locator("a[href*='/fr-fr/emplois/']")
+        count = links.count()
+        print(f"[DEBUG] Liens détectés HelloWork: {count}")
 
-        # 1) Ratisser large: liens plausibles d'offres
-        offer_links = page.locator("a[href*='/fr-fr/emploi/'], a[href*='/offre/']")
-        count = offer_links.count()
-        if count == 0:
-            offer_links = page.locator("a:has-text('Offre'), a:has-text('Poste')")
-            count = offer_links.count()
+        for i in range(count):
+            href = links.nth(i).get_attribute("href") or ""
+            if not re.search(r"/emplois/\d+\.html$", href):
+                continue  # Garde uniquement les vraies annonces
 
-        for i in range(min(count, 120)):  # limite raisonnable
-            a = offer_links.nth(i)
-            href = a.get_attribute("href") or ""
-            txt = (a.inner_text() or "").strip()
-            if not txt:
-                continue
-
-            # Normaliser l’URL absolue
             if href.startswith("/"):
-                base = page.url.split("/", 3)
-                if len(base) >= 3:
-                    href = f"{base[0]}//{base[2]}{href}"
+                href = f"https://www.hellowork.com{href}"
 
-            # Remonter au container (carte probable)
-            container = a.locator("xpath=ancestor::article[1]")
-            if container.count() == 0:
-                container = a.locator("xpath=ancestor::*[self::li or self::div][contains(@class,'card')][1]")
+            # Remonter à l'article parent
+            container = links.nth(i).locator("xpath=ancestor::article[1]")
 
-            # Titre
-            title = txt
+            title = ""
             try:
-                t2 = container.locator("[data-testid='job-title'], h2, h3, .title").first
-                if t2.count() > 0:
-                    title = (t2.inner_text() or title).strip()
-            except Exception:
+                title = (container.locator("h3, h2").first.inner_text() or "").strip()
+            except:
                 pass
 
-            # Entreprise
             company = ""
-            for sel in ["[data-testid='company-name']", ".company", ".recruiter",
-                        "[itemprop='hiringOrganization']", ".job-company"]:
-                try:
-                    el = container.locator(sel).first
-                    if el.count() > 0:
-                        company = (el.inner_text() or "").strip()
-                        break
-                except Exception:
-                    pass
+            try:
+                company = (container.locator(".company, [data-testid='company-name']").first.inner_text() or "").strip()
+            except:
+                pass
 
-            # Localisation
             location = ""
-            for sel in ["[data-testid='location']", ".location", "[itemprop='addressLocality']",
-                        ".job-location"]:
-                try:
-                    el = container.locator(sel).first
-                    if el.count() > 0:
-                        location = (el.inner_text() or "").strip()
-                        break
-                except Exception:
-                    pass
+            try:
+                location = (container.locator(".location, [data-testid='location']").first.inner_text() or "").strip()
+            except:
+                pass
 
-            # Filtrer le bruit évident
-            if len(title) < 4 or "cookie" in title.lower():
+            if not title:
                 continue
 
-            item = JobItem(source="hellowork", poste=title)
-            set_if(item, "entreprise", company)
-            set_if(item, "localisation", location)
-            item.commentaires = href
-            jobs.append(item)
+            job = JobItem(source="hellowork", poste=title)
+            set_if(job, "entreprise", company)
+            set_if(job, "localisation", location)
+            job["commentaires"] = href
+            jobs.append(job)
 
         browser.close()
-        return uniq(jobs)
+    return uniq(jobs)
 
-# ==================================
-# Adapter: Jobs That Make Sense (JMS)
-# ==================================
-def fetch_makesense(url: str) -> list[JobItem]:
+# =====================
+# Scraper Makesense (exemple)
+# =====================
+def fetch_makesense(url: str) -> list:
+    jobs = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = browser.new_context(user_agent="Mozilla/5.0", locale="fr-FR")
+        ctx = browser.new_context(locale="fr-FR")
         page = ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.goto(url, wait_until="networkidle", timeout=90000)
 
-        # Consent
-        for txt in ["Tout accepter", "Accepter", "J’accepte", "J'accepte", "OK"]:
-            try:
-                page.get_by_role("button", name=txt, exact=False).click(timeout=2000)
-                break
-            except Exception:
-                pass
-
-        # Lazy load
-        for _ in range(12):
-            page.mouse.wheel(0, 1500)
+        for _ in range(8):
+            page.mouse.wheel(0, 2000)
             page.wait_for_timeout(300)
 
-        jobs: list[JobItem] = []
-        selectors = [
-            "[data-testid='job-card']",
-            "article[data-testid='listing-card']",
-            "article.card, div.job-card, article"
-        ]
-        cards = []
-        for sel in selectors:
-            nodes = page.query_selector_all(sel)
-            if nodes:
-                cards = nodes
-                break
+        cards = page.locator("a[href*='/fr/s/jobs/']")
+        count = cards.count()
+        print(f"[DEBUG] Liens détectés Makesense: {count}")
 
-        for c in cards:
-            title = (c.query_selector("[data-testid='job-title']") or
-                     c.query_selector("h3, h2, a"))
-            poste = normalize(title.inner_text()) if title else ""
+        for i in range(count):
+            href = cards.nth(i).get_attribute("href") or ""
+            if not href.startswith("http"):
+                href = f"https://jobs.makesense.org{href}"
 
-            company = (c.query_selector("[data-testid='company-name']") or
-                       c.query_selector(".company, .employer"))
-            entreprise = normalize(company.inner_text()) if company else ""
+            title = ""
+            try:
+                title = (cards.nth(i).inner_text() or "").strip().split("\n")[0]
+            except:
+                pass
 
-            loc = (c.query_selector("[data-testid='location']") or
-                   c.query_selector(".location"))
-            localisation = normalize(loc.inner_text()) if loc else "Paris (75)"
+            if not title:
+                continue
 
-            link = (c.query_selector("a[href*='/fr/s/jobs/']") or c.query_selector("a"))
-            lien = link.get_attribute("href") if link else ""
-            if lien and lien.startswith("/"):
-                base = page.url.split("/", 3)
-                if len(base) >= 3:
-                    lien = f"{base[0]}//{base[2]}{lien}"
-
-            if poste:
-                item = JobItem(source="jobs.makesense", poste=poste)
-                set_if(item, "entreprise", entreprise)
-                set_if(item, "localisation", localisation)
-                item.commentaires = lien or ""
-                jobs.append(item)
+            job = JobItem(source="makesense", poste=title)
+            job["commentaires"] = href
+            jobs.append(job)
 
         browser.close()
-        return uniq(jobs)
+    return uniq(jobs)
 
-# =========================
-# Adapter selector (router)
-# =========================
-def select_adapter(url: str):
-    if "hellowork.com" in url:
-        return fetch_hellowork
-    if "jobs.makesense.org" in url:
-        return fetch_makesense
-    dynamic_domains = ["welcometothejungle.com"]
-    return fetch_dynamic if any(d in url for d in dynamic_domains) else fetch_static
+# =====================
+# Routes Flask
+# =====================
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify({"status": "ok"})
 
-# =========
-# Routes
-# =========
-@app.get("/")
-def root():
-    return "ok", 200
-
-@app.get("/healthz")
-def health():
-    return "ok", 200
-
-@app.post("/echo")
-def echo():
-    try:
-        data = request.get_json(force=True)
-    except Exception:
-        data = {"raw": request.data.decode("utf-8", errors="ignore")}
-    return jsonify({"received": data})
-
-@app.post("/scrape")
+@app.route("/scrape", methods=["POST"])
 def scrape():
-    payload = request.get_json(force=True) or {}
-    urls: list[str] = payload.get("urls", [])
-    out: list[dict] = []
-    for u in urls:
-        try:
-            adapter = select_adapter(u)
-            items = adapter(u)
-            out.extend([i.model_dump() for i in items])
-        except Exception as e:
-            out.append(JobItem(source=u, commentaires=f"ERROR: {type(e).__name__}: {e}").model_dump())
-    return jsonify(out)
+    data = request.get_json(force=True)
+    urls = data.get("urls", [])
+    all_jobs = []
 
-# =========
-# Main
-# =========
+    for url in urls:
+        if "hellowork.com" in url:
+            all_jobs.extend(fetch_hellowork(url))
+        elif "makesense" in url:
+            all_jobs.extend(fetch_makesense(url))
+        else:
+            print(f"[WARN] Source non gérée: {url}")
+
+    return jsonify(all_jobs)
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    print(f"[boot] Starting Flask on 0.0.0.0:{port}", file=sys.stderr, flush=True)
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000)
